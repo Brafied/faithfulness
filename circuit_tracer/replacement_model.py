@@ -786,6 +786,164 @@ class ReplacementModel(HookedTransformer):
 
             return generation, logit_cache[0], activation_cache
 
+
+    def _get_error_vectors(
+        self,
+        inputs: Union[str, torch.Tensor],
+    ):
+        mlp_in_matrix = {}
+        mlp_out_matrix = {}
+
+        def cache_mlp_in(acts, hook, layer):
+            mlp_in_matrix[layer] = acts
+        def cache_mlp_out(acts, hook, layer):
+            mlp_out_matrix[layer] = acts
+
+        activation_hooks = []
+        for layer in range(self.cfg.n_layers):
+            activation_hooks.append(
+                (
+                    f"blocks.{layer}.{self.feature_input_hook}",
+                    partial(cache_mlp_in, layer=layer)
+                )
+            )
+            activation_hooks.append(
+                (
+                    f"blocks.{layer}.{self.original_feature_output_hook}",
+                    partial(cache_mlp_out, layer=layer),
+                )
+            )
+
+        with self.hooks(activation_hooks):
+            self(inputs)
+        
+        error_vectors = {}
+        for layer in range(self.cfg.n_layers):
+            reconstruction = self.transcoders[layer].decode(self.transcoders[layer].encode(mlp_in_matrix[layer]))
+            error_vectors[layer] = mlp_out_matrix[layer] - reconstruction
+
+        return error_vectors
+
+
+    def _get_graph_ablation_hooks(
+        self,
+        inputs: Union[str, torch.Tensor],
+        selected_features: List[tuple[int, int, int]],
+        selected_errors: List[tuple[int, int]],
+        direct_effects: bool = False,
+        freeze_attention: bool = True,
+        apply_activation_function: bool = True,
+        sparse: bool = False,
+    ):
+        error_vectors = self._get_error_vectors(inputs)
+
+        features_by_layer = defaultdict(list)
+        for layer, pos, feature_idx in selected_features:
+            features_by_layer[layer].append((pos, feature_idx))
+        errors_by_layer = defaultdict(list)
+        for layer, pos in selected_errors:
+            errors_by_layer[layer].append(pos)
+
+        # This activation cache will fill up during our forward intervention pass
+        activation_cache, activation_hooks = self._get_activation_caching_hooks(
+            apply_activation_function=apply_activation_function, sparse=sparse, append=False
+        )
+
+        def intervention_hook(activations, hook, layer: int, layer_features, layer_errors):
+            transcoder_activations = activation_cache[layer]
+            if transcoder_activations.is_sparse:
+                transcoder_activations = transcoder_activations.to_dense()
+
+            if not apply_activation_function:
+                transcoder_activations = (
+                    self.transcoders[layer]
+                    .activation_function(transcoder_activations.unsqueeze(0))
+                    .squeeze(0)
+                )
+
+            transcoder_activations = transcoder_activations.clone()
+            feature_ablation_mask = torch.ones_like(transcoder_activations, dtype=torch.bool)
+            for pos, feature_idx in layer_features:
+                feature_ablation_mask[pos, feature_idx] = 0.0
+            transcoder_activations[feature_ablation_mask] = 0.0
+            new_transcoder_output = self.transcoders[layer].decode(transcoder_activations)
+
+            transcoder_error_vectors = error_vectors[layer].clone().squeeze()
+            error_ablation_mask = torch.ones_like(transcoder_error_vectors, dtype=torch.bool)
+            for pos in layer_errors:
+                error_ablation_mask[pos] = 0.0
+            transcoder_error_vectors[error_ablation_mask] = 0.0
+            new_transcoder_output += transcoder_error_vectors
+
+            return new_transcoder_output
+        
+        intervention_hooks = []
+        for layer in range(self.cfg.n_layers):
+            layer_features = features_by_layer.get(layer, [])
+            layer_errors = errors_by_layer.get(layer, [])
+            intervention_hooks.append(
+                (
+                    f"blocks.{layer}.{self.feature_output_hook}",
+                    partial(
+                        intervention_hook, 
+                        layer=layer, 
+                        layer_features=layer_features, 
+                        layer_errors=layer_errors
+                    ),
+                )
+            )
+
+        all_hooks = (
+            self.setup_intervention_with_freeze(inputs, direct_effects=direct_effects)
+            if freeze_attention or direct_effects
+            else []
+        )
+        all_hooks += activation_hooks + intervention_hooks
+
+        cached_logits = [None]
+
+        def logit_cache_hook(activations, hook):
+            # we need to manually apply the softcap (if used by the model), as it comes post-hook
+            if self.cfg.output_logits_soft_cap > 0.0:
+                logits = self.cfg.output_logits_soft_cap * F.tanh(
+                    activations / self.cfg.output_logits_soft_cap
+                )
+            else:
+                logits = activations.clone()
+            cached_logits[0] = logits
+
+        all_hooks.append(("unembed.hook_post", logit_cache_hook))
+
+        return all_hooks, cached_logits, activation_cache
+
+    @torch.no_grad
+    def graph_ablation(
+        self,
+        inputs: Union[str, torch.Tensor],
+        selected_features: List[tuple[int, int, int]],
+        selected_errors: List[tuple[int, int]],
+        direct_effects: bool = False,
+        freeze_attention: bool = True,
+        apply_activation_function: bool = True,
+        sparse: bool = False,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        hooks, _, activation_cache = self._get_graph_ablation_hooks(
+            inputs,
+            selected_features,
+            selected_errors,
+            direct_effects=direct_effects,
+            freeze_attention=freeze_attention,
+            apply_activation_function=apply_activation_function,
+            sparse=sparse,
+        )
+
+        with self.hooks(hooks):
+            logits = self(inputs)
+
+        activation_cache = torch.stack(activation_cache)
+
+        return logits, activation_cache
+    
     def __del__(self):
         # Prevent memory leaks
         self.reset_hooks(including_permanent=True)
