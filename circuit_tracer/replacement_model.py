@@ -905,6 +905,7 @@ class ReplacementModel(HookedTransformer):
         selected_errors: List[tuple[int, int]],
         mean_ablate: bool = True,
         mean_ablation_samples: int = 100,
+        retain_bos_features: bool = True,
         direct_effects: bool = False,
         freeze_attention: bool = True,
     ):
@@ -941,6 +942,10 @@ class ReplacementModel(HookedTransformer):
             for pos in layer_errors:
                 ablated_errors[pos] = error_vectors_layer[pos]
 
+            if retain_bos_features:
+                ablated_activations[0] = transcoder_activations_layer[0]
+                ablated_errors[0] = error_vectors_layer[0]
+
             return self.transcoders[layer].decode(ablated_activations) + ablated_errors
         
         intervention_hooks = []
@@ -975,6 +980,7 @@ class ReplacementModel(HookedTransformer):
         selected_errors: List[tuple[int, int]],
         mean_ablate: bool = True,
         mean_ablation_samples: int = 100,
+        retain_bos_features = True,
         direct_effects: bool = False,
         freeze_attention: bool = True,
     ) -> torch.Tensor:
@@ -984,6 +990,7 @@ class ReplacementModel(HookedTransformer):
             selected_errors,
             mean_ablate=mean_ablate,
             mean_ablation_samples=mean_ablation_samples,
+            retain_bos_features=retain_bos_features,
             direct_effects=direct_effects,
             freeze_attention=freeze_attention,
         )
