@@ -834,7 +834,7 @@ class ReplacementModel(HookedTransformer):
                     truncation=True,
                     max_length=sequence_length,
                 )["input_ids"]
-                self(tokens)
+                self(tokens.to(self.cfg.device))
 
         transcoder_activations = defaultdict(list)
         error_vectors = defaultdict(list)
@@ -931,8 +931,8 @@ class ReplacementModel(HookedTransformer):
             error_vectors_layer = error_vectors[layer].squeeze()
 
             if mean_ablate:
-                ablated_activations = mean_transcoder_activations[layer].squeeze()
-                ablated_errors = mean_error_vectors[layer].squeeze()
+                ablated_activations = mean_transcoder_activations[layer].squeeze().clone()
+                ablated_errors = mean_error_vectors[layer].squeeze().clone()
             else:
                 ablated_activations = torch.zeros_like(transcoder_activations_layer)
                 ablated_errors = torch.zeros_like(error_vectors_layer)
@@ -1016,7 +1016,7 @@ class ReplacementModel(HookedTransformer):
         if isinstance(completion, str):
             completion_id = self.tokenizer(completion).input_ids[-1]
         elif isinstance(completion, torch.Tensor):
-            completion_id = completion.squeeze()[-1]
+            completion_id = completion.squeeze()[-1].item()
         else:
             raise TypeError(f"Unsupported answer type: {type(completion)}")
         
