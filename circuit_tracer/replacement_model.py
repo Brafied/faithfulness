@@ -1000,6 +1000,65 @@ class ReplacementModel(HookedTransformer):
 
         return logits
     
+    @torch.no_grad
+    def graph_faithfulness(
+        self,
+        input: Union[str, torch.Tensor],
+        completion: Union[str, torch.Tensor],
+        selected_features: List[tuple[int, int, int]],
+        selected_errors: List[tuple[int, int]],
+        mean_ablate: bool = True,
+        mean_ablation_samples: int = 100,
+        retain_bos_features = True,
+        direct_effects: bool = False,
+        freeze_attention: bool = True,
+    ) -> float:
+        if isinstance(completion, str):
+            completion_id = self.tokenizer(completion).input_ids[-1]
+        elif isinstance(completion, torch.Tensor):
+            completion_id = completion.squeeze()[-1]
+        else:
+            raise TypeError(f"Unsupported answer type: {type(completion)}")
+        
+        def metric_fn(logits):
+            logits = logits.squeeze()[-1]
+            answer_logit = logits[completion_id]
+            top_values, top_indicies = torch.topk(logits, 11)
+            mask = top_indicies != completion_id
+            mean_top_10 = top_values[mask][:10].mean()
+            return answer_logit - mean_top_10
+        
+        with torch.inference_mode():
+            full_logits = self(input)
+            full_metric = metric_fn(full_logits).item()
+
+            empty_logits = self.graph_ablation(
+                input=input,
+                selected_features=[],
+                selected_errors=[],
+                mean_ablate=mean_ablate,
+                mean_ablation_samples=mean_ablation_samples,
+                retain_bos_features=retain_bos_features,
+                direct_effects=direct_effects,
+                freeze_attention=freeze_attention
+            )
+            empty_metric = metric_fn(empty_logits).item()
+
+            circuit_logits = self.graph_ablation(
+                input=input,
+                selected_features=selected_features,
+                selected_errors=selected_errors,
+                mean_ablate=mean_ablate,
+                mean_ablation_samples=mean_ablation_samples,
+                retain_bos_features=retain_bos_features,
+                direct_effects=direct_effects,
+                freeze_attention=freeze_attention,
+            )
+            circuit_metric = metric_fn(circuit_logits).item()
+
+            return (circuit_metric - empty_metric) / (full_metric - empty_metric)
+
+
     def __del__(self):
         # Prevent memory leaks
         self.reset_hooks(including_permanent=True)
